@@ -70,6 +70,8 @@ public class FuseJavaGate {
      * 1. {@link #scanFuseMethods()} — 反射扫描 MediaProvider 中所有含 "Fuse" 的方法
      * 2. {@link BehaviorRegistry#lookup(String)} — 按方法名查找行为模板（精确匹配 → 启发式回退）
      * 3. {@link ParameterAnalyzer#analyze(Method)} — 推断 pathIndex / uidIndex 等参数角色
+     * 3.5 {@link #sanitizeRoles(Method, ParamRoles)} — 签名清洗：path 非法才拒绝，
+     *     path2/uid 噪声钳制为 -1 走运行时回退
      * 4. {@link #installHook(Method, BehaviorHandler, ParamRoles)} — 统一异常安全包装后安装
      * <p>
      * 未知方法仅记录日志，不会导致崩溃。
@@ -89,10 +91,22 @@ public class FuseJavaGate {
                 unknownMethods.add(dm.method.getName() + " " + Arrays.toString(dm.method.getParameterTypes()));
                 continue;
             }
-            final ParamRoles roles = ParameterAnalyzer.analyze(dm.method);
-            if (roles == null || roles.pathIndex < 0) {
+            // 语义门：仅 rename 行为需要第二路径，其余行为即使有两个 String 也不标 path2。
+            // 与 BehaviorRegistry 的 "rename" 启发式保持一致（精确 renameForFuse 亦含该子串）。
+            final boolean needPath2 = dm.method.getName().toLowerCase(Locale.ROOT).contains("rename");
+            final ParamRoles rawRoles = ParameterAnalyzer.analyze(dm.method, needPath2);
+            if (rawRoles == null || rawRoles.pathIndex < 0) {
                 unknownMethods.add(dm.method.getName() + " " + Arrays.toString(dm.method.getParameterTypes())
                         + " (unanalyzable params)");
+                continue;
+            }
+            // 签名清洗：仅 path 自身非法时拒绝安装；path2/uid 推断噪声钳制为 -1
+            // 走运行时回退（resolveUid/各 handler 已有 guarded 保护），恢复基线覆盖率。
+            // 静态方法允许安装——handler 异常由 GuardedHook 隔离，基线已证明安全。
+            final ParamRoles roles = sanitizeRoles(dm.method, rawRoles);
+            if (roles == null) {
+                unknownMethods.add(dm.method.getName() + " " + Arrays.toString(dm.method.getParameterTypes())
+                        + " (bad path " + rawRoles + ")");
                 continue;
             }
             final String signature = dm.method.getName() + " " + Arrays.toString(dm.method.getParameterTypes());
@@ -386,44 +400,6 @@ public class FuseJavaGate {
     }
 
     /**
-     * 参数角色 —— 静态分析阶段确定的方法参数职责。
-     * <p>
-     * 分离"参数在哪"（roles）和"用它做什么"（BehaviorHandler），
-     * 使得同一个行为模板可以处理不同参数布局的方法签名。
-     */
-    private static class ParamRoles {
-        /** 主要路径参数索引（通常是第一个 String） */
-        final int pathIndex;
-        /** 第二个路径参数索引（rename 场景），-1 表示不存在 */
-        final int path2Index;
-        /** uid 参数索引，-1 表示需运行时推断 */
-        final int uidIndex;
-        /** 额外参数角色语义 */
-        final ExtraParamRole extraRole;
-
-        ParamRoles(int pathIndex, int path2Index, int uidIndex, ExtraParamRole extraRole) {
-            this.pathIndex = pathIndex;
-            this.path2Index = path2Index;
-            this.uidIndex = uidIndex;
-            this.extraRole = extraRole;
-        }
-
-        @Override
-        public String toString() {
-            return "ParamRoles{path=" + pathIndex + ", path2=" + path2Index
-                    + ", uid=" + uidIndex + ", extra=" + extraRole + "}";
-        }
-    }
-
-    /** 额外参数角色的语义分类 */
-    private enum ExtraParamRole {
-        NONE,            // 无额外参数 / 不需要额外处理
-        ACCESS_TYPE_INT, // 第三个参数是 int accessType
-        ACCESS_TYPE_BOOL,// 第三个参数是 boolean forCreate
-        IGNORE           // 有多余参数但忽略（如 HyperOS delete 的第三个 int）
-    }
-
-    /**
      * BehaviorRegistry — 方法名到行为模板的映射注册表。
      * <p>
      * 匹配策略（两级回退）：
@@ -529,108 +505,45 @@ public class FuseJavaGate {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════
+    //  签名可信度校验（启发式匹配收紧约束）
+    // ════════════════════════════════════════════════════════════════
+
     /**
-     * ParameterAnalyzer — 静态参数角色推断。
-     * <p>
-     * 根据方法名的命名模式和参数类型序列，推断 pathIndex、uidIndex 等参数角色。
-     * 三层推断策略：
-     * <p>
-     * Level 1 — 方法名模式识别：
-     * - "isUid" 前缀 → 参数反转 (int uid, String path)
-     * - "isDir"/"isDirectory" 前缀 → uid 固定在 index 1
-     * <p>
-     * Level 2 — 参数类型序列分析：
-     * - (String, int) → path@0, uid@1
-     * - (String, String, int) → path@0, path2@1, uid@2
-     * - (String, int, int) → path@0, uid@1, extra=ACCESS_TYPE_INT
-     * - (String, int, boolean) → path@0, uid@1, extra=ACCESS_TYPE_BOOL
-     * <p>
-     * Level 3 — uidIndex = -1（运行时由 {@link #resolveUid} 值推断）
+     * 签名清洗 —— 仅做通用型结构钳制，不按行为模板区分需求：
+     * <ul>
+     *   <li>path 下标：越界 / 非 String 即返回 null（调用方记 UNKNOWN 且永不安装，
+     *   此类 hook 在运行时必定 ClassCast，安装毫无意义）</li>
+     *   <li>path2 下标：越界 / 非 String / 与 path 重合即钳制为 -1，
+     *   由各 handler 的运行时逻辑与 GuardedHook 兜底（基线行为）</li>
+     *   <li>uid 下标：-1 表示运行时推断，直接保留；越界 / 非 int-Integer /
+     *   与 path/path2 重合即钳制为 -1，由 {@link #resolveUid} 值推断回退</li>
+     *   <li>静态方法：允许通过。handler 异常由 GuardedHook 隔离不污染宿主，
+     *   基线已 hook 此类 synthetic lambda 且运行正常，拒绝反而造成覆盖回归</li>
+     * </ul>
      */
-    private static class ParameterAnalyzer {
-
-        /**
-         * 分析方法的参数角色。
-         *
-         * @param method 反射方法对象
-         * @return ParamRoles，或 null 如果无法分析（无 String 参数等）
-         */
-        static ParamRoles analyze(final Method method) {
-            final String name = method.getName().toLowerCase(Locale.ROOT);
-            final Class<?>[] types = method.getParameterTypes();
-
-            // ── Level 1: 方法名模式识别 ──
-
-            // isUid* 系列：参数反转 (int uid, String path)
-            if (name.startsWith("isuid") && types.length >= 2) {
-                return new ParamRoles(/*pathIndex=*/1, /*path2Index=*/-1,
-                        /*uidIndex=*/0, ExtraParamRole.NONE);
-            }
-
-            // ── 路径参数发现 ──
-            int pathIndex = -1;
-            int path2Index = -1;
-            for (int i = 0; i < types.length; i++) {
-                if (types[i] == String.class) {
-                    if (pathIndex < 0) {
-                        pathIndex = i;
-                    } else if (path2Index < 0) {
-                        path2Index = i;
-                    }
-                }
-            }
-            if (pathIndex < 0) {
-                return null; // 没有 String 路径参数
-            }
-
-            // ── Level 1 cont'd: isDir/isDirectory — uid 固定在 index 1 ──
-            if (name.startsWith("isdir") || name.startsWith("isdirectory")) {
-                int uidIdx = (types.length > 1 && types[1] == int.class) ? 1 : -1;
-                ExtraParamRole extra = ExtraParamRole.NONE;
-                if (types.length > 2) {
-                    if (types[2] == boolean.class) {
-                        extra = ExtraParamRole.ACCESS_TYPE_BOOL;
-                    } else if (types[2] == int.class) {
-                        extra = ExtraParamRole.ACCESS_TYPE_INT;
-                    }
-                }
-                return new ParamRoles(pathIndex, path2Index, uidIdx, extra);
-            }
-
-            // ── Level 2: 参数类型序列分析 ──
-            int uidIndex = -1;
-            ExtraParamRole extra = ExtraParamRole.NONE;
-
-            // 收集所有 int 参数索引
-            final List<Integer> intIndices = new ArrayList<>();
-            for (int i = 0; i < types.length; i++) {
-                if (types[i] == int.class) {
-                    intIndices.add(i);
-                }
-            }
-
-            if (intIndices.isEmpty()) {
-                // 无 int 参数 → 运行时推断 uid
-                return new ParamRoles(pathIndex, path2Index, -1, ExtraParamRole.NONE);
-            }
-
-            // 单 int 参数 → 一定是 uid
-            if (intIndices.size() == 1) {
-                uidIndex = intIndices.get(0);
-                return new ParamRoles(pathIndex, path2Index, uidIndex, ExtraParamRole.NONE);
-            }
-
-            // 多 int 参数 —— 根据方法名判断
-            uidIndex = intIndices.get(0); // 默认第一个 int 是 uid
-
-            if (name.contains("delete")) {
-                // deleteFileForFuse(String, int, int) → 第三个 int 忽略
-                extra = ExtraParamRole.IGNORE;
-            }
-            // 其他情况（如 openWithFuse 多重建载）：第一个 int 是 uid，多余的静默忽略
-
-            return new ParamRoles(pathIndex, path2Index, uidIndex, extra);
+    private static ParamRoles sanitizeRoles(final Method method, final ParamRoles roles) {
+        if (roles == null) {
+            return null;
         }
+        // 纯决策下沉到 FuseRoleSanitizer（零 Android 依赖，可单测），此处只做日志与组装。
+        final int[] clean = FuseRoleSanitizerKt.sanitizeRoleIndices(
+                roles.pathIndex, roles.path2Index, roles.uidIndex, method.getParameterTypes());
+        if (clean == null) {
+            return null;
+        }
+        if (clean[1] != roles.path2Index) {
+            Log.w("MC_REDIRECT", "[FuseJavaGate] clamping path2Index " + roles.path2Index + " to -1 for "
+                    + method.getName() + " " + Arrays.toString(method.getParameterTypes()));
+        }
+        if (clean[2] != roles.uidIndex) {
+            Log.w("MC_REDIRECT", "[FuseJavaGate] clamping uidIndex " + roles.uidIndex + " to -1 for "
+                    + method.getName() + " " + Arrays.toString(method.getParameterTypes()));
+        }
+        if (clean[1] == roles.path2Index && clean[2] == roles.uidIndex) {
+            return roles;
+        }
+        return new ParamRoles(clean[0], clean[1], clean[2], roles.extraRole);
     }
 
     // ════════════════════════════════════════════════════════════════
