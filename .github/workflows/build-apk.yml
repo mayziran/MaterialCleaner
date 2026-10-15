@@ -41,15 +41,25 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # v3 默认 packages 为 'tools platform-tools'，其中 'tools' 已从
+          # SDK 仓库移除，sdkmanager tools 返回 1 会让整个 job 在装 SDK 处即失败。
+          packages: 'platform-tools'
 
       - name: Accept licenses and install SDK components
         shell: bash
         run: |
           yes | sdkmanager --licenses >/dev/null || true
+          # 与根 build.gradle 的 compileSdk/buildToolsVersion/ndkVersion
+          # 以及 app/build.gradle 的 externalNativeBuild.cmake.version 对齐。
+          # ubuntu-latest 只预装 CMake 3.31.5/4.1.2 与 NDK 27.3/29.0/30.0，
+          # 不装 cmake;3.22.1 就会落到 AGP 自动下载或直接报
+          # "CMake '3.22.1' was not found in SDK, PATH, or by cmake.dir property"。
           sdkmanager --install \
             "platforms;android-34" \
             "build-tools;34.0.0" \
-            "ndk;26.1.10909125"
+            "ndk;26.1.10909125" \
+            "cmake;3.22.1"
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
