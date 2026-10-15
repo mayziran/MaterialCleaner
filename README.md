@@ -68,8 +68,7 @@ MaterialCleaner/
 │   └── hidden-api/              # Android hidden API 桥接与 SystemService 封装
 ├── app/src/main/cpp/            # native：libcleaner（VFS/mount）、libinline（FUSE Hook + xhook）、starter
 ├── app/src/main/assets/         # xposed_init + main.jar（buildXposedMainJar 生成）
-├── shared/                      # 历史兼容公共库，迁移中逐步瘦身
-├── docs/adr/                    # 架构决策记录（10 篇）
+├── docs/adr/                    # 架构决策记录（14 篇，状态见 docs/architecture/adr-status.md）
 ├── scripts/gates/               # 门禁检查脚本
 └── MaterialCleaner.wiki/        # GitHub Wiki（中文文档主页）
 ```
@@ -173,6 +172,14 @@ App → Shell.cmd(Starter.command) → start.sh → starter (ELF 二进制)
 - **定制 ROM 兼容性**：部分定制系统（MIUI/HyperOS）可能因 SELinux 策略导致 bind mount 失败
 - **FUSE Native Hook 依赖平台形态**：Android 版本、APEX MediaProvider 与 libfuse_jni.so 加载方式会影响可用 Hook 模式
 - **main.jar 需随代码更新**：修改 `runtime/media-provider-hook` 后需重新构建，Gradle task 会自动处理
+
+## 赞助
+
+vibe coding的价格有些超出预期🫠，如果觉得软件好用可以赞助作者。
+
+[![爱发电赞助作者](Donate.jpg)](https://www.ifdian.net/a/firesahc)
+
+> 图片加载失败？请直接访问 [https://www.ifdian.net/a/firesahc](https://www.ifdian.net/a/firesahc)
 
 ## 原作者的话
 

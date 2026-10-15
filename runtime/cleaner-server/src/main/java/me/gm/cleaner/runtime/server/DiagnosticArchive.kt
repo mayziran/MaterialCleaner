@@ -5,7 +5,11 @@ import android.os.ParcelFileDescriptor
 import android.system.Os
 import android.util.Log
 import me.gm.cleaner.core.storage.redirect.databus.DataBus
+import me.gm.cleaner.core.storage.redirect.databus.DataBusProtocol
+import me.gm.cleaner.runtime.server.orchestrator.MediaProviderHookLayerReporter
+import me.gm.cleaner.runtime.server.orchestrator.NativeHookLayerReporter
 import me.gm.cleaner.runtime.server.orchestrator.ServerErrorJournal
+import me.gm.cleaner.runtime.server.vfs.VfsProcessCensus
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -19,7 +23,6 @@ import java.nio.file.LinkOption
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -27,7 +30,6 @@ object DiagnosticArchive {
     private const val TAG = "DiagnosticArchive"
     private const val OUTPUT_DIR = "/data/local/tmp/cleaner_diagnostics"
     private const val AUTO_LOG_DIR = "/data/local/tmp/cleaner_logs"
-    private const val MAX_COMMAND_BYTES = 4 * 1024 * 1024
     private const val MAX_TEXT_FILE_BYTES = 512 * 1024
     private const val MAX_AUTO_LOG_FILES = 8
     private const val MAX_EVENT_FILES = 20
@@ -158,20 +160,23 @@ object DiagnosticArchive {
         if (health != null) {
             appendLine("DataBus:")
             appendLine("- initialized=${health.initialized}, healthy=${health.healthy}, criticalSnapshotsReady=${health.criticalSnapshotsReady}")
-            appendLine("- eventQueueCounts=${health.eventQueueCounts}")
+            appendLine("- eventQueueCounts=${health.eventQueueCounts} (physical, includes consumed-but-retained)")
+            appendLine("- pendingEventCounts=${health.pendingEventCounts} (drives backlog alerts)")
+            appendLine("- quarantineCounts=${health.quarantineCounts}")
+            appendLine("- cursorReadStates=${health.cursorReadStates} (UNREADABLE queues excluded from backlog)")
             appendLine("- leaseCounts=${health.leaseCounts}")
             appendLine("- missingDirectories=${health.missingDirectories.size}, permissionIssues=${health.permissionIssues.size}")
             appendLine()
         }
 
-        val nativeStatus = DataBus.readSnapshotSafe(DataBus.SNAPSHOT_NATIVE_HOOK_STATUS)
+        val nativeStatus = DataBus.readSnapshotSafe(DataBusProtocol.SNAPSHOT_NATIVE_HOOK_STATUS)
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
         if (nativeStatus != null) {
             appendNativeHookSummary(nativeStatus)
             appendLine()
         }
 
-        val platformCaps = DataBus.readSnapshotSafe(DataBus.SNAPSHOT_PLATFORM_CAPABILITIES)
+        val platformCaps = DataBus.readSnapshotSafe(DataBusProtocol.SNAPSHOT_PLATFORM_CAPABILITIES)
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
         if (platformCaps != null) {
             appendLine("Platform capabilities:")
@@ -181,7 +186,94 @@ object DiagnosticArchive {
             appendLine()
         }
 
+        if (status != null) {
+            appendLine("Key signals:")
+            appendKeySignals(status)
+            appendLine()
+        }
+
         appendLine("If the package is hard to read, start from this file, then open the referenced files above.")
+    }
+
+    /**
+     * P1 诊断质量：陈列 status JSON 中的关键信号。
+     *
+     * 职责边界：本函数只**陈列事实**，不做状态裁决——裁决归 Reporter
+     * （[NativeHookLayerReporter] / [MediaProviderHookLayerReporter]），
+     * 此处直接展示其结论与证据字段。自造判定词会与运行状态分叉，
+     * 正是历史上"摘要显示 synced 而实际 STALE"的成因。
+     */
+    internal fun StringBuilder.appendKeySignals(status: JSONObject) {
+        val vfs = status.optJSONObject("vfs")
+        val mp = status.optJSONObject("mediaProviderJavaHook")
+        val fuse = status.optJSONObject("fuseNativeHook")
+        if (vfs == null || mp == null || fuse == null) return
+        // FUSE：展示 Reporter 的权威裁决 + 支撑证据，不再自行推导 synced/pending
+        val appliedEpoch = fuse.optString(NativeHookLayerReporter.KEY_APPLIED_EPOCH, "")
+        val snapshotEpoch = fuse.optString(NativeHookLayerReporter.KEY_SNAPSHOT_EPOCH, "")
+        val policySynced = fuse.optBoolean(NativeHookLayerReporter.KEY_POLICY_SYNCED, false)
+        val verdict = fuse.optString(NativeHookLayerReporter.KEY_SYNC_VERDICT, "UNKNOWN")
+        val layerState = fuse.optString("state", "UNKNOWN")
+        if (appliedEpoch.isNotBlank() && snapshotEpoch.isNotBlank()) {
+            val epoch = if (appliedEpoch == snapshotEpoch) "consistent" else "MISMATCH"
+            appendLine("- FUSE: state=$layerState, sync=$verdict, " +
+                    "epoch=$epoch, policySynced=$policySynced")
+        }
+        // 恢复熔断：展示 Reporter 结论与计数（attempts 语义）
+        val wakeOnly = mp.optBoolean(MediaProviderHookLayerReporter.KEY_WAKE_ONLY_MODE, false)
+        val rounds = mp.optInt(MediaProviderHookLayerReporter.KEY_DESTRUCTIVE_ROUNDS, 0)
+        if (wakeOnly || rounds > 0) {
+            appendLine("- MediaProvider recovery: state=${mp.optString("state", "UNKNOWN")}, " +
+                    "wakeOnly=$wakeOnly, destructiveAttempts=$rounds/3")
+        }
+        // VFS 分母
+        val unmanaged = vfs.optInt(VfsProcessCensus.KEY_UNMANAGED, -1)
+        val managed = vfs.optInt(VfsProcessCensus.KEY_MANAGED, -1)
+        if (unmanaged >= 0 && managed >= 0) {
+            appendLine("- VFS pids: managed=$managed, unmanaged=$unmanaged")
+        }
+        // srStatus 截断
+        val truncated = vfs.optBoolean(VfsProcessCensus.KEY_SR_TRUNCATED, false)
+        val total = vfs.optInt(VfsProcessCensus.KEY_SR_TOTAL, -1)
+        if (total >= 0) {
+            appendLine("- srStatus: total=$total, truncated=$truncated")
+        }
+    }
+
+    /** 中文概览：同样只陈列 Reporter 结论，不自行裁决。 */
+    internal fun StringBuilder.appendKeySignalsZhCn(status: JSONObject) {
+        val vfs = status.optJSONObject("vfs")
+        val mp = status.optJSONObject("mediaProviderJavaHook")
+        val fuse = status.optJSONObject("fuseNativeHook")
+        if (vfs == null || mp == null || fuse == null) return
+        val appliedEpoch = fuse.optString(NativeHookLayerReporter.KEY_APPLIED_EPOCH, "")
+        val snapshotEpoch = fuse.optString(NativeHookLayerReporter.KEY_SNAPSHOT_EPOCH, "")
+        val policySynced = fuse.optBoolean(NativeHookLayerReporter.KEY_POLICY_SYNCED, false)
+        val verdict = fuse.optString(NativeHookLayerReporter.KEY_SYNC_VERDICT, "UNKNOWN")
+        val layerState = fuse.optString("state", "UNKNOWN")
+        if (appliedEpoch.isNotBlank() && snapshotEpoch.isNotBlank()) {
+            val epoch = if (appliedEpoch == snapshotEpoch) "一致" else "不一致"
+            appendLine("- FUSE：状态=$layerState，同步=$verdict，代次=$epoch，策略同步=$policySynced")
+        }
+        // 恢复熔断（attempts 语义）
+        val wakeOnly = mp.optBoolean(MediaProviderHookLayerReporter.KEY_WAKE_ONLY_MODE, false)
+        val rounds = mp.optInt(MediaProviderHookLayerReporter.KEY_DESTRUCTIVE_ROUNDS, 0)
+        if (wakeOnly || rounds > 0) {
+            appendLine("- MediaProvider 恢复：状态=${mp.optString("state", "UNKNOWN")}，" +
+                    "仅唤醒=$wakeOnly，破坏性尝试=$rounds/3")
+        }
+        // VFS 分母
+        val unmanaged = vfs.optInt(VfsProcessCensus.KEY_UNMANAGED, -1)
+        val managed = vfs.optInt(VfsProcessCensus.KEY_MANAGED, -1)
+        if (unmanaged >= 0 && managed >= 0) {
+            appendLine("- VFS 进程：已管理=$managed，未接管=$unmanaged")
+        }
+        // srStatus 截断
+        val truncated = vfs.optBoolean(VfsProcessCensus.KEY_SR_TRUNCATED, false)
+        val total = vfs.optInt(VfsProcessCensus.KEY_SR_TOTAL, -1)
+        if (total >= 0) {
+            appendLine("- srStatus：总数=$total，已截断=$truncated")
+        }
     }
 
     private fun buildSummaryZhCn(server: CleanerServer): String = buildString {
@@ -215,26 +307,35 @@ object DiagnosticArchive {
         if (health != null) {
             appendLine("DataBus：")
             appendLine("- initialized=${health.initialized}, healthy=${health.healthy}, criticalSnapshotsReady=${health.criticalSnapshotsReady}")
-            appendLine("- eventQueueCounts=${health.eventQueueCounts}")
+            appendLine("- eventQueueCounts=${health.eventQueueCounts}（物理量，含已消费未清理）")
+            appendLine("- pendingEventCounts=${health.pendingEventCounts}（待处理，唯一告警口径）")
+            appendLine("- quarantineCounts=${health.quarantineCounts}")
+            appendLine("- cursorReadStates=${health.cursorReadStates}（UNREADABLE 队列不计入告警）")
             appendLine("- leaseCounts=${health.leaseCounts}")
             appendLine("- missingDirectories=${health.missingDirectories.size}, permissionIssues=${health.permissionIssues.size}")
             appendLine()
         }
 
-        val nativeStatus = DataBus.readSnapshotSafe(DataBus.SNAPSHOT_NATIVE_HOOK_STATUS)
+        val nativeStatus = DataBus.readSnapshotSafe(DataBusProtocol.SNAPSHOT_NATIVE_HOOK_STATUS)
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
         if (nativeStatus != null) {
             appendNativeHookSummaryZhCn(nativeStatus)
             appendLine()
         }
 
-        val platformCaps = DataBus.readSnapshotSafe(DataBus.SNAPSHOT_PLATFORM_CAPABILITIES)
+        val platformCaps = DataBus.readSnapshotSafe(DataBusProtocol.SNAPSHOT_PLATFORM_CAPABILITIES)
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
         if (platformCaps != null) {
             appendLine("平台能力：")
             appendLine("- sdk=${platformCaps.optInt("sdkVersionInt", 0)}, fuse=${platformCaps.optBoolean("fuseAvailable", false)}, fuseBpf=${platformCaps.optBoolean("isFuseBpfEnabled", false)}")
             appendLine("- mediaProvider=${platformCaps.optString("mediaProviderPackageName", "")}")
             appendLine("- fuseJniLoadMode=${platformCaps.optString("fuseJniLoadMode", "UNKNOWN")}, nativeHookMode=${platformCaps.optString("supportedNativeHookMode", "UNKNOWN")}")
+            appendLine()
+        }
+
+        if (status != null) {
+            appendLine("关键信号：")
+            appendKeySignalsZhCn(status)
             appendLine()
         }
 
@@ -285,7 +386,7 @@ object DiagnosticArchive {
         appendLine("- inline.state=${inline?.optString("state", "UNKNOWN") ?: "UNKNOWN"}, retryCount=${inline?.optInt("retryCount", 0) ?: 0}, disabledByPlatform=${inline?.optBoolean("disabledByPlatform", false) ?: false}")
         appendLine("- fuseLibraryLoaded=${native?.optBoolean("fuseLibraryLoaded", false) ?: false}, hookMode=${native?.optString("hookMode", "UNKNOWN") ?: "UNKNOWN"}, fuseJniLoadMode=${native?.optString("fuseJniLoadMode", "UNKNOWN") ?: "UNKNOWN"}")
         if (symbols != null) {
-            appendLine("- symbols containsMount=${symbols.optBoolean("containsMount", false)}, startsWith=${symbols.optBoolean("startsWith", false)}, isFuseBpfEnabled=${symbols.optBoolean("isFuseBpfEnabled", false)}, fuseReqUserdata=${symbols.optBoolean("fuseReqUserdata", false)}, fuseBpfInstall=${symbols.optBoolean("fuseBpfInstall", false)}")
+            appendLine("- symbols containsMount=${symbols.optBoolean("containsMount", false)}, startsWith=${symbols.optBoolean("startsWith", false)}, isFuseBpfEnabled=${symbols.optBoolean("isFuseBpfEnabled", false)}, fuseReqUserdata=${symbols.optBoolean("fuseReqUserdata", false)}, fillEntries=${symbols.optBoolean("fillEntries", false)}, install=${symbols.optBoolean("install", false)}, effective=${symbols.optBoolean("effective", false)}")
         }
         if (missingSymbols != null && missingSymbols.length() > 0) {
             appendLine("- missingSymbols=$missingSymbols")
@@ -308,7 +409,7 @@ object DiagnosticArchive {
         appendLine("- inline.state=${inline?.optString("state", "UNKNOWN") ?: "UNKNOWN"}, retryCount=${inline?.optInt("retryCount", 0) ?: 0}, disabledByPlatform=${inline?.optBoolean("disabledByPlatform", false) ?: false}")
         appendLine("- fuseLibraryLoaded=${native?.optBoolean("fuseLibraryLoaded", false) ?: false}, hookMode=${native?.optString("hookMode", "UNKNOWN") ?: "UNKNOWN"}, fuseJniLoadMode=${native?.optString("fuseJniLoadMode", "UNKNOWN") ?: "UNKNOWN"}")
         if (symbols != null) {
-            appendLine("- symbols containsMount=${symbols.optBoolean("containsMount", false)}, startsWith=${symbols.optBoolean("startsWith", false)}, isFuseBpfEnabled=${symbols.optBoolean("isFuseBpfEnabled", false)}, fuseReqUserdata=${symbols.optBoolean("fuseReqUserdata", false)}, fuseBpfInstall=${symbols.optBoolean("fuseBpfInstall", false)}")
+            appendLine("- symbols containsMount=${symbols.optBoolean("containsMount", false)}, startsWith=${symbols.optBoolean("startsWith", false)}, isFuseBpfEnabled=${symbols.optBoolean("isFuseBpfEnabled", false)}, fuseReqUserdata=${symbols.optBoolean("fuseReqUserdata", false)}, fillEntries=${symbols.optBoolean("fillEntries", false)}, install=${symbols.optBoolean("install", false)}, effective=${symbols.optBoolean("effective", false)}")
         }
         if (missingSymbols != null && missingSymbols.length() > 0) {
             appendLine("- missingSymbols=$missingSymbols")
@@ -323,20 +424,20 @@ object DiagnosticArchive {
         runCatching {
             val status = server.layerOrchestrator.collectStatusJson()
             addText(zip, "status/orchestrated_status.json", status)
-            DataBus.writeSnapshot(DataBus.SNAPSHOT_ORCHESTRATED_STATUS, status)
+            DataBus.writeSnapshot(DataBusProtocol.SNAPSHOT_ORCHESTRATED_STATUS, status)
         }.onFailure {
             addText(zip, "status/orchestrated_status_error.txt", it.stackTraceToString())
         }
         runCatching {
             addText(zip, "status/server_exception.txt", server.cleanerService.serverException.toString())
         }
-        addSnapshotIfExists(zip, DataBus.SNAPSHOT_NATIVE_HOOK_STATUS,
+        addSnapshotIfExists(zip, DataBusProtocol.SNAPSHOT_NATIVE_HOOK_STATUS,
             "status/native_hook_status_pretty.json")
         addNativeHookSectionIfExists(zip, "fuseJavaGate",
             "status/fuse_java_gate_status.json")
-        addSnapshotIfExists(zip, DataBus.SNAPSHOT_PLATFORM_CAPABILITIES,
+        addSnapshotIfExists(zip, DataBusProtocol.SNAPSHOT_PLATFORM_CAPABILITIES,
             "status/platform_capabilities.json")
-        addSnapshotIfExists(zip, DataBus.SNAPSHOT_CONFIGURED_MOUNT_POINTS,
+        addSnapshotIfExists(zip, DataBusProtocol.SNAPSHOT_CONFIGURED_MOUNT_POINTS,
             "status/configured_mount_points.json")
     }
 
@@ -372,33 +473,67 @@ object DiagnosticArchive {
     private fun addDataBus(zip: ZipOutputStream) {
         val initialized = DataBus.ensureInitialized()
         addText(zip, "databus/initialized.txt", initialized.toString())
+        val busRoot = File(DataBus.BUS_ROOT)
         runCatching {
-            addText(zip, "databus/health.json", healthToJson(DataBus.checkHealth(repair = true)).toString(2))
+            // P1 诊断质量：归档侧补齐隔离/计数/总账，不改 HealthReport 协议
+            val healthJson = healthToJson(DataBus.checkHealth(repair = true))
+            val q1 = File(busRoot, "events/${DataBusProtocol.EVENT_FILESYSTEM}.quarantine")
+            val q2 = File(busRoot, "events/${DataBusProtocol.EVENT_REDIRECT_NOTICE}.quarantine")
+            val a1 = File(busRoot, "cursors/${DataBusProtocol.EVENT_FILESYSTEM}.attempts")
+            val a2 = File(busRoot, "cursors/${DataBusProtocol.EVENT_REDIRECT_NOTICE}.attempts")
+            val recovery = File(busRoot, "cursors/media_provider_recovery.json")
+            healthJson.put("quarantineCounts", JSONObject().apply {
+                put("filesystem", q1.listFiles()?.count { it.isFile() && it.name.endsWith(".json") } ?: 0)
+                put("redirectNotice", q2.listFiles()?.count { it.isFile() && it.name.endsWith(".json") } ?: 0)
+            })
+            healthJson.put("attemptCounts", JSONObject().apply {
+                put("filesystem", a1.listFiles()?.count { it.isFile() } ?: 0)
+                put("redirectNotice", a2.listFiles()?.count { it.isFile() } ?: 0)
+            })
+            healthJson.put("recoveryStateExists", recovery.exists())
+            addText(zip, "databus/health.json", healthJson.toString(2))
         }.onFailure {
             addText(zip, "databus/health_error.txt", it.stackTraceToString())
         }
 
-        val busRoot = File(DataBus.BUS_ROOT)
         addDirectoryFiles(zip, File(busRoot, "snapshots"), "databus/snapshots", Int.MAX_VALUE)
         addDirectoryFiles(zip, File(busRoot, "signals"), "databus/signals", Int.MAX_VALUE)
         addDirectoryFiles(zip, File(busRoot, "cursors"), "databus/cursors", Int.MAX_VALUE)
-        addDirectoryFiles(zip, File(busRoot, "events/${DataBus.EVENT_FILESYSTEM}"),
-            "databus/events/${DataBus.EVENT_FILESYSTEM}", MAX_EVENT_FILES)
-        addDirectoryFiles(zip, File(busRoot, "events/${DataBus.EVENT_REDIRECT_NOTICE}"),
-            "databus/events/${DataBus.EVENT_REDIRECT_NOTICE}", MAX_EVENT_FILES)
+        addDirectoryFiles(zip, File(busRoot, "events/${DataBusProtocol.EVENT_FILESYSTEM}"),
+            "databus/events/${DataBusProtocol.EVENT_FILESYSTEM}", MAX_EVENT_FILES)
+        addDirectoryFiles(zip, File(busRoot, "events/${DataBusProtocol.EVENT_REDIRECT_NOTICE}"),
+            "databus/events/${DataBusProtocol.EVENT_REDIRECT_NOTICE}", MAX_EVENT_FILES)
         addDirectoryFiles(zip, File(busRoot, "events/consumed"),
             "databus/events/consumed", MAX_EVENT_FILES)
-        addDirectoryFiles(zip, File(busRoot, "leases/${DataBus.LEASE_QUERY_SESSIONS}"),
-            "databus/leases/${DataBus.LEASE_QUERY_SESSIONS}", MAX_EVENT_FILES)
+        addDirectoryFiles(zip, File(busRoot, "leases/${DataBusProtocol.LEASE_QUERY_SESSIONS}"),
+            "databus/leases/${DataBusProtocol.LEASE_QUERY_SESSIONS}", MAX_EVENT_FILES)
+        // P0-1：毒丸隔离与重试计数目录（Fix 1′/P0-B 产物，world-readable，只读导出）
+        addDirectoryFiles(zip,
+            File(busRoot, "events/${DataBusProtocol.EVENT_FILESYSTEM}.quarantine"),
+            "databus/events/${DataBusProtocol.EVENT_FILESYSTEM}.quarantine", MAX_EVENT_FILES)
+        addDirectoryFiles(zip,
+            File(busRoot, "events/${DataBusProtocol.EVENT_REDIRECT_NOTICE}.quarantine"),
+            "databus/events/${DataBusProtocol.EVENT_REDIRECT_NOTICE}.quarantine", MAX_EVENT_FILES)
+        addDirectoryFiles(zip,
+            File(busRoot, "cursors/${DataBusProtocol.EVENT_FILESYSTEM}.attempts"),
+            "databus/cursors/${DataBusProtocol.EVENT_FILESYSTEM}.attempts", MAX_EVENT_FILES)
+        addDirectoryFiles(zip,
+            File(busRoot, "cursors/${DataBusProtocol.EVENT_REDIRECT_NOTICE}.attempts"),
+            "databus/cursors/${DataBusProtocol.EVENT_REDIRECT_NOTICE}.attempts", MAX_EVENT_FILES)
     }
 
-    private fun healthToJson(health: DataBus.HealthReport): JSONObject = JSONObject().apply {
+    private fun healthToJson(health: DataBusProtocol.HealthReport): JSONObject = JSONObject().apply {
         put("initialized", health.initialized)
         put("healthy", health.healthy)
         put("criticalSnapshotsReady", health.criticalSnapshotsReady)
         put("missingDirectories", JSONArray(health.missingDirectories))
         put("permissionIssues", JSONArray(health.permissionIssues))
         put("eventQueueCounts", JSONObject(health.eventQueueCounts))
+        put("pendingEventCounts", JSONObject(health.pendingEventCounts))
+        put("quarantineCounts", JSONObject(health.quarantineCounts))
+        put("cursorReadStates", JSONObject(
+            health.cursorReadStates.mapValues { it.value.name },
+        ))
         put("leaseCounts", JSONObject(health.leaseCounts))
         put("snapshots", JSONArray().apply {
             for (snapshot in health.snapshots) {
@@ -436,13 +571,14 @@ object DiagnosticArchive {
 
     private fun addAutoLogs(zip: ZipOutputStream) {
         val dir = File(AUTO_LOG_DIR)
-        val files = dir.listFiles()
+        val all = dir.listFiles()
             ?.filter { isRegularFileNoFollow(it) && it.name.endsWith(".log") }
             ?.sortedByDescending { it.lastModified() }
-            ?.take(MAX_AUTO_LOG_FILES)
             ?: emptyList()
+        val files = all.take(MAX_AUTO_LOG_FILES)
         addText(zip, "logs/auto_logging_manifest.txt", buildString {
             appendLine("dir=$AUTO_LOG_DIR")
+            appendLine("total=${all.size}")
             appendLine("included=${files.size}")
             for (file in files) {
                 appendLine("${file.name}\tsize=${file.length()}\tmodified=${file.lastModified()}")
@@ -475,14 +611,16 @@ object DiagnosticArchive {
         entryPrefix: String,
         maxFiles: Int,
     ) {
-        val files = dir.listFiles()
+        val all = dir.listFiles()
             ?.filter { isRegularFileNoFollow(it) }
             ?.sortedWith(compareByDescending<File> { it.lastModified() }.thenBy { it.name })
-            ?.take(maxFiles)
             ?: emptyList()
+        val files = all.take(maxFiles)
         addText(zip, "$entryPrefix/manifest.txt", buildString {
             appendLine("path=${dir.path}")
             appendLine("exists=${dir.exists()}")
+            // 可审计：记录目录总数，排障者可判断证据是否完整
+            appendLine("total=${all.size}")
             appendLine("included=${files.size}")
             for (file in files) {
                 appendLine("${file.name}\tsize=${file.length()}\tmodified=${file.lastModified()}")
@@ -494,7 +632,7 @@ object DiagnosticArchive {
     }
 
     private fun addCommand(zip: ZipOutputStream, entryName: String, command: String) {
-        val result = runCommand(command)
+        val result = DiagnosticCommandRunner.runCommand(command)
         addText(zip, entryName, buildString {
             appendLine("$ $command")
             appendLine("exitCode=${result.exitCode}")
@@ -518,58 +656,11 @@ object DiagnosticArchive {
         sectionName: String,
         entryName: String,
     ) {
-        val content = DataBus.readSnapshotSafe(DataBus.SNAPSHOT_NATIVE_HOOK_STATUS) ?: return
+        val content = DataBus.readSnapshotSafe(DataBusProtocol.SNAPSHOT_NATIVE_HOOK_STATUS) ?: return
         val section = runCatching {
             JSONObject(content).optJSONObject(sectionName)
         }.getOrNull() ?: return
         addText(zip, entryName, section.toString(2))
-    }
-
-    private fun runCommand(command: String): CommandResult {
-        var process: Process? = null
-        return try {
-            process = ProcessBuilder("/system/bin/sh", "-c", command)
-                .redirectErrorStream(true)
-                .start()
-            val output = ByteArrayOutputStream()
-            var truncated = false
-            val reader = Thread {
-                try {
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    val input = process.inputStream
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        if (output.size() + read <= MAX_COMMAND_BYTES) {
-                            output.write(buffer, 0, read)
-                        } else {
-                            val allowed = MAX_COMMAND_BYTES - output.size()
-                            if (allowed > 0) output.write(buffer, 0, allowed)
-                            truncated = true
-                            process.destroy()
-                            break
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
-            reader.start()
-            val finished = process.waitFor(15, TimeUnit.SECONDS)
-            if (!finished) {
-                process.destroyForcibly()
-            }
-            reader.join(1000)
-            CommandResult(
-                exitCode = if (finished) process.exitValue() else -1,
-                timedOut = !finished,
-                truncated = truncated,
-                output = output.toString(StandardCharsets.UTF_8.name()),
-            )
-        } catch (e: Exception) {
-            CommandResult(-1, timedOut = false, truncated = false, output = e.stackTraceToString())
-        } finally {
-            process?.destroy()
-        }
     }
 
     private fun addFileTail(zip: ZipOutputStream, file: File, entryName: String, maxBytes: Int) {
@@ -649,10 +740,6 @@ object DiagnosticArchive {
         }
     }
 
-    private data class CommandResult(
-        val exitCode: Int,
-        val timedOut: Boolean,
-        val truncated: Boolean,
-        val output: String,
-    )
+    // 命令执行实现见 DiagnosticCommandRunner（G2 粒度抽离）；
+    // 历史 CommandResult 已迁移为 DiagnosticCommandRunner.CommandResult。
 }

@@ -2,10 +2,10 @@ import org.apache.tools.ant.DirectoryScanner
 
 DirectoryScanner.removeDefaultExclude('**/.gitattributes')
 
-rootProject.name = "Cleaner"
+rootProject.name = "MaterialCleaner"
 
-// ── 应用与共享模块 ──
-include ':app', ':shared'
+// ── 应用模块 ──
+include ':app'
 
 // ── 架构模块 ──
 include ':core:ipc-contract'
@@ -13,6 +13,8 @@ include ':core:common'
 include ':core:storage-redirect-domain'
 include ':core:storage-redirect-databus'
 include ':core:config-store'
+// Android 隐藏 API 编译桩：仅供 compileOnly，不进运行时与 R8 图
+include ':hidden-api-stub'
 include ':platform:hidden-api'
 include ':runtime:cleaner-server'
 include ':runtime:media-provider-hook'

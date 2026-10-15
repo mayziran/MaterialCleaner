@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Service -->
+    <string name="aggressively_prompt_for_reading_media_files_key">aggressively_prompt_for_reading_media_files</string>
+    <string name="auto_logging_key">auto_logging</string>
+    <string name="record_shared_storage_key" translatable="false">record_shared_storage</string>
+    <string name="record_external_app_specific_storage_key" translatable="false">record_external_app_specific_storage</string>
+    <string name="fuse_bpf_block_all_key" translatable="false">fuse_bpf_block_all</string>
+    <string name="upsert_key" translatable="false">upsert</string>
+</resources>
