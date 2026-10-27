@@ -8,18 +8,21 @@ import me.gm.cleaner.core.storage.redirect.databus.DataBusProtocol
 import me.gm.cleaner.runtime.mediaprovider.hook.policy.NativeStatusSnapshotParser.describe
 
 object NativeHookStatus {
-    private const val TAG = "NativeHookStatus"
+    internal const val TAG = "NativeHookStatus"
     private const val SCHEMA_VERSION = 2
 
     /** 快照内受控文本（错误详情等）的最大长度，超出截断。 */
-    private const val MAX_TEXT_LENGTH = 200
+    internal const val MAX_TEXT_LENGTH = 200
 
     /**
      * 宿主预期异常（swallowedHostExceptions）计数的快照发布最小间隔。
      * 该路径可能被宿主高频触发（如 query 对特定参数抛 IllegalArgumentException），
      * 窗口内的增量由下一次任意 mark* 发布顺带带出，避免快照通道风暴。
+     *
+     * 取值由 [GuardedHookCircuitState] 持有，本处仅作转发以保持既有引用点。
      */
-    private const val SWALLOWED_PUBLISH_INTERVAL_MILLIS = 30_000L
+    internal const val SWALLOWED_PUBLISH_INTERVAL_MILLIS =
+        GuardedHookCircuitState.SWALLOWED_PUBLISH_INTERVAL_MILLIS
 
     private const val STATE_NOT_LOADED = "NOT_LOADED"
     private const val STATE_INLINE_LOADED = "INLINE_LOADED"
@@ -177,22 +180,15 @@ object NativeHookStatus {
     private var bridgeLastAttemptAt = 0L
 
     // ── 受防护 hook（AbstractGuardedHook 子类）熔断观测 ──
-    @Volatile
-    private var guardedCircuitOpenCount = 0
-    @Volatile
-    private var guardedLastFailedHook = ""
-    @Volatile
-    private var guardedLastFailedMethod = ""
-    @Volatile
-    private var guardedLastFailureType = ""
-    @Volatile
-    private var guardedTotalOpenTransitions = 0L
-    @Volatile
-    private var guardedRecoveredCount = 0L
-    @Volatile
-    private var guardedSwallowedHostExceptions = 0L
-    @Volatile
-    private var guardedSwallowedLastPublishAt = 0L
+    // 状态与序列化归 GuardedHookCircuitState（同一子域，独立文件）。
+    private val guardedCircuitState = GuardedHookCircuitState()
+
+    // ── Hook 层失败事实（本次 Hook 会话内收集） ──
+    // 语义边界：只陈述"发生了什么"，不做状态裁决。消费方据此把
+    // "MediaProvider Hook unavailable" 这类模糊结论细化为
+    // 目标类缺失 / 桥注册失败 / binder 死亡 / 重试耗尽 / 熔断打开。
+    // 收集与序列化归 HookErrorCollector（同一职责，独立文件）。
+    private val hookErrorCollector = HookErrorCollector()
 
     fun markMediaProviderHookLoaded(packageName: String) {
         mediaProviderHookLoaded = true
@@ -576,20 +572,13 @@ object NativeHookStatus {
      * [failureType] 为触发异常的类简名；打开计数与历史转换数同步递增。
      */
     fun markGuardedCircuitOpened(hookName: String, method: String, failureType: String) {
-        guardedCircuitOpenCount += 1
-        guardedTotalOpenTransitions += 1
-        guardedLastFailedHook = hookName
-        guardedLastFailedMethod = method
-        guardedLastFailureType = failureType.take(MAX_TEXT_LENGTH)
+        guardedCircuitState.markCircuitOpened(hookName, method, failureType)
         publishSnapshot()
     }
 
     /** 受防护 hook 半开探针成功、熔断恢复闭合。 */
     fun markGuardedCircuitRecovered(hookName: String) {
-        if (guardedCircuitOpenCount > 0) {
-            guardedCircuitOpenCount -= 1
-        }
-        guardedRecoveredCount += 1
+        guardedCircuitState.markCircuitRecovered()
         publishSnapshot()
     }
 
@@ -599,12 +588,37 @@ object NativeHookStatus {
      * 不改变任何控制流。
      */
     fun markGuardedHostExceptionSwallowed() {
-        guardedSwallowedHostExceptions += 1
-        val now = System.currentTimeMillis()
-        if (now - guardedSwallowedLastPublishAt >= SWALLOWED_PUBLISH_INTERVAL_MILLIS) {
-            guardedSwallowedLastPublishAt = now
+        if (guardedCircuitState.markHostExceptionSwallowed()) {
             publishSnapshot()
         }
+    }
+
+    /**
+     * 记录一条 Hook 层失败事实。
+     *
+     * 约束（按优先级排序，均为硬约束）：
+     * 1. **永不抛出** —— 调用点在宿主线程执行，一旦抛出就会污染宿主进程，
+     *    因此整段逻辑用 runCatching 包裹；
+     * 2. **线程安全** —— Hook 方法可能在宿主多线程并发进入；
+     * 3. **容量有界** —— 最多保留 [MAX_HOOK_ERRORS] 条，超出淘汰最旧。
+     *
+     * 记录后立即发布快照，让失败事实进入既有结构化通道
+     * （DataBus 快照 `native_hook_status.json` 的 `hookErrors` 段）。
+     *
+     * @param code 统一错误码，必须引用 [ErrorCodes.HOOK_JAVA_*] 常量，
+     *             便于消费方机器归并同类故障。
+     * @param detail 受控短文本（阶段名/包名/异常类名等），
+     *                禁止写入明文路径或任何用户数据。
+     */
+    fun recordHookError(code: String, detail: String?) {
+        val entry = hookErrorCollector.record(code, detail) ?: return
+        // 先发布快照再打日志：发布路径自身已吞掉异常，不会阻断日志输出；
+        // 日志是"快照没发布成功"时的兜底可见性。
+        publishSnapshot()
+        Log.w(
+            HookErrorCollector.LOG_TAG,
+            "hook error recorded: code=" + entry.code + ", detail=" + entry.detail
+        )
     }
 
     fun publishSnapshot() {
@@ -659,15 +673,10 @@ object NativeHookStatus {
                 put("attemptCount", bridgeAttemptCount)
                 put("lastAttemptAt", bridgeLastAttemptAt)
             })
-            put("guardedHooks", JSONObject().apply {
-                put("circuitOpenCount", guardedCircuitOpenCount)
-                put("lastFailedHook", guardedLastFailedHook)
-                put("lastFailedMethod", guardedLastFailedMethod)
-                put("lastFailureType", guardedLastFailureType)
-                put("totalOpenTransitions", guardedTotalOpenTransitions)
-                put("recoveredCount", guardedRecoveredCount)
-                put("swallowedHostExceptions", guardedSwallowedHostExceptions)
-            })
+            put("guardedHooks", guardedCircuitState.toJson())
+            // Hook 层失败事实：把"为什么 Hook 不可用"落到可机器读取的字段上。
+            // 纯附加段，既有字段语义不变，老消费方忽略即可。
+            put("hookErrors", hookErrorCollector.toJson())
             put("inline", JSONObject().apply {
                 put("state", inlineState)
                 put("loaded", inlineLibraryLoaded)

@@ -51,6 +51,8 @@
     <string name="new_version_available">发现新版本 %s</string>
     <string name="click_to_view_release">点击查看更新说明</string>
     <string name="update_available_channel_name">更新可用</string>
+    <string name="update_check_up_to_date">当前已是最新版本（%s）</string>
+    <string name="update_check_failed">检查更新失败，请检查网络后重试</string>
     <string name="language_header">语言</string>
     <string name="language_title">语言</string>
     <string name="theme_header">主题</string>
@@ -83,6 +85,9 @@
     <string name="aggressively_prompt_for_reading_media_files_summary">会出现很多不必要的提示，不过如果您对存储重定向功能还不熟悉，开启有助于减少意外问题</string>
     <string name="auto_logging_title">保存日志到文件用于诊断</string>
     <string name="auto_logging_summary">持续将 logcat 输出写入 /data/local/tmp/cleaner_logs/，有助于排查启动或崩溃问题。</string>
+    <string name="auto_logging_stats_summary">日志：%1$s，共 %2$d 个文件</string>
+    <string name="log_stats_unavailable">暂时无法获取日志统计</string>
+    <string name="log_stats_service_unavailable">Cleaner 服务未运行，请启动服务</string>
     <string name="app_category_title">在线应用类型标记</string>
     <string name="record_shared_storage_title">记录共享存储空间中的文件操作</string>
     <string name="record_external_app_specific_storage_title">（实验性）记录外部应用专属存储空间中的文件操作</string>
@@ -109,8 +114,8 @@
     <string name="service_status_daemon">服务进程: PID %1$s | Root %2$s</string>
     <string name="service_status_mounted">已挂载: %1$d 个应用 | %2$d 条规则</string>
     <string name="service_status_xposed">Xposed Hooks: %1$s</string>
-    <string name="btn_start_service">启动服务</string>
-    <string name="btn_stop_service">停止服务</string>
+    <string name="btn_start_service">启动\n服务</string>
+    <string name="btn_stop_service">停止\n服务</string>
     <string name="toast_starting">正在启动</string>
     <string name="toast_stopped">已停止</string>
     <string name="service_stopped_manually">服务已停止，点击"启动服务"恢复</string>
@@ -209,7 +214,7 @@
     <string name="parent_directory">..</string>
 
     <!-- 服务 -->
-    <string name="confirm_exit_restart">重新启动</string>
+    <string name="confirm_restart_service">重启 Cleaner 服务</string>
     <string name="no_root_access">无法访问 root</string>
     <string name="service_need_upgrade">服务需升级</string>
     <string name="service_need_reboot">已安装更新，请重启手机</string>

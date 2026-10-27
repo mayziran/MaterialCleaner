@@ -12,12 +12,8 @@ import me.gm.cleaner.runtime.server.orchestrator.ServerErrorJournal
 import me.gm.cleaner.runtime.server.vfs.VfsProcessCensus
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.RandomAccessFile
-import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.text.SimpleDateFormat
@@ -30,7 +26,6 @@ object DiagnosticArchive {
     private const val TAG = "DiagnosticArchive"
     private const val OUTPUT_DIR = "/data/local/tmp/cleaner_diagnostics"
     private const val AUTO_LOG_DIR = "/data/local/tmp/cleaner_logs"
-    private const val MAX_TEXT_FILE_BYTES = 512 * 1024
     private const val MAX_AUTO_LOG_FILES = 8
     private const val MAX_EVENT_FILES = 20
 
@@ -139,6 +134,8 @@ object DiagnosticArchive {
         appendLine("- databus/health.json has queue, snapshot, and permission health.")
         appendLine("- logs/logcat_material_cleaner_filtered.txt has focused runtime logs.")
         appendLine("- commands/media_provider_maps.txt and commands/media_provider_mountinfo.txt prove native loading and mount state.")
+        appendLine("- commands/dmesg_evidence.txt has kernel-side denials (SELinux avc, FUSE, mount, namespace).")
+        appendLine("- logs/logcat_crash_recent.txt and logs/logcat_media_provider_pid.txt cover crash and hook-host evidence.")
         appendLine()
 
         val status = runCatching { JSONObject(server.layerOrchestrator.collectStatusJson()) }
@@ -286,6 +283,8 @@ object DiagnosticArchive {
         appendLine("- databus/health.json：队列、快照和权限健康状态。")
         appendLine("- logs/logcat_material_cleaner_filtered.txt：聚焦运行日志。")
         appendLine("- commands/media_provider_maps.txt 与 commands/media_provider_mountinfo.txt：native 加载与挂载状态证据。")
+        appendLine("- commands/dmesg_evidence.txt：内核侧拒绝证据（SELinux avc、FUSE、mount、namespace）。")
+        appendLine("- logs/logcat_crash_recent.txt 与 logs/logcat_media_provider_pid.txt：崩溃与 Hook 宿主进程证据。")
         appendLine()
 
         val status = runCatching { JSONObject(server.layerOrchestrator.collectStatusJson()) }
@@ -391,6 +390,7 @@ object DiagnosticArchive {
         if (missingSymbols != null && missingSymbols.length() > 0) {
             appendLine("- missingSymbols=$missingSymbols")
         }
+        appendHookErrorsSummary(root)
         val lastError = native?.optString("lastError", "") ?: ""
         if (lastError.isNotBlank()) {
             appendLine("- lastError=$lastError")
@@ -414,12 +414,16 @@ object DiagnosticArchive {
         if (missingSymbols != null && missingSymbols.length() > 0) {
             appendLine("- missingSymbols=$missingSymbols")
         }
+        appendHookErrorsSummaryZhCn(root)
         val lastError = native?.optString("lastError", "") ?: ""
         if (lastError.isNotBlank()) {
             appendLine("- lastError=$lastError")
         }
     }
 
+    /**
+     * 中文版 Hook 失败事实摘要，语义与英文版一致。
+     */
     private fun addStatus(zip: ZipOutputStream, server: CleanerServer) {
         runCatching {
             val status = server.layerOrchestrator.collectStatusJson()
@@ -445,26 +449,13 @@ object DiagnosticArchive {
      * 导出结构化错误事件流水（JSON Lines，每行一个 ErrorEvent 的紧凑表示）。
      * 与 orchestrated_status.json 中的 recentErrors 数组同源，
      * 供离线工具按错误码归并统计。
+     *
+     * 取持久层全文而非内存快照：持久层跨服务重启保留，
+     * 内存环形缓冲只有 50 条且进程重启即清零。
      */
     private fun addErrorJournal(zip: ZipOutputStream) {
         runCatching {
-            val events = ServerErrorJournal.snapshot()
-            if (events.isEmpty()) {
-                addText(zip, "errors/journal.jsonl", "")
-                return
-            }
-            val lines = events.joinToString(separator = "\n") { event ->
-                JSONObject().apply {
-                    put("code", event.code)
-                    put("atElapsed", event.atElapsed)
-                    if (event.errno != 0) put("errno", event.errno)
-                    event.subject?.let { put("subject", it) }
-                    event.pathDigest?.let { put("pathDigest", it) }
-                    if (event.generation > 0L) put("generation", event.generation)
-                    event.detail?.let { put("detail", it) }
-                }.toString()
-            }
-            addText(zip, "errors/journal.jsonl", lines)
+            addText(zip, "errors/journal.jsonl", ServerErrorJournal.exportJsonL())
         }.onFailure {
             addText(zip, "errors/journal_error.txt", it.stackTraceToString())
         }
@@ -557,15 +548,26 @@ object DiagnosticArchive {
             zip,
             "logs/logcat_material_cleaner_filtered.txt",
             "/system/bin/logcat -d -v threadtime -b main,system,crash -t 3000 " +
-                    "MC_BOOT:* MC_EVENT:* MC_STATE:* MC_DIAG:* MC_NATIVE:* " +
-                    "MC_REDIRECT:* DataBus:* DiagnosticArchive:* CleanerService:* " +
-                    "LayerOrchestrator:* SnapshotPublisher:* HookRecoveryCoordinator:* " +
-                    "MediaProviderRecoveryStrategy:* NativeHookStatus:* HookPolicyCache:* " +
-                    "FuseNativePolicyAdapter:* HookDataBusBridge:* EventConsumerScheduler:* " +
-                    "FileSystemEventConsumer:* RedirectNoticeConsumer:* QuerySessionLeaseConsumer:* " +
-                    "ActivityManagerLogsObserver:* AMLogs:* MC/Test:* MC/StateMachine:* " +
-                    "CleanerTest:* xhook:* starter:* " +
-                    "me.gm.cleaner:* *:S",
+                    LogTagFilter.FILTER_SPEC,
+        )
+        // 崩溃 buffer 独立取证：crash 的 tag 是崩溃进程名，无法用固定白名单穷举，
+        // 故此处不做 tag 过滤；crash buffer 仅在崩溃时写入，体积可忽略。
+        addCommand(
+            zip,
+            "logs/logcat_crash_recent.txt",
+            "/system/bin/logcat -d -v threadtime -b crash -t 2000",
+        )
+        // 目标进程（MediaProvider）定向取证：Hook 住在该进程内，其自身 tag
+        // （FuseDaemon 等）不在本项目白名单内，只能按 pid 定向抓取。
+        addCommand(
+            zip,
+            "logs/logcat_media_provider_pid.txt",
+            "MPID=$(${'$'}(pidof com.android.providers.media.module " +
+                    "com.android.providers.media " +
+                    "com.google.android.providers.media.module 2>/dev/null | awk '{print ${'$'}1}')); " +
+                    "if [ -z \"${'$'}MPID\" ]; then " +
+                    "echo 'media provider process is not running (no pid found)'; " +
+                    "else /system/bin/logcat -d -v threadtime --pid=${'$'}MPID -t 2000; fi",
         )
     }
 
@@ -585,7 +587,7 @@ object DiagnosticArchive {
             }
         })
         for (file in files) {
-            addFileTail(zip, file, "logs/auto/${file.name}", MAX_TEXT_FILE_BYTES)
+            addFileHeadAndTail(zip, file, "logs/auto/${file.name}", MAX_TEXT_FILE_BYTES)
         }
     }
 
@@ -599,35 +601,14 @@ object DiagnosticArchive {
             "commands/mount_storage.txt" to "mount | grep -E '/storage|/mnt/runtime|/Android/data|fuse' || true",
             "commands/databus_tree.txt" to "ls -laR ${DataBus.BUS_ROOT} 2>&1 | head -400",
             "commands/auto_logs_tree.txt" to "ls -laR $AUTO_LOG_DIR 2>&1 | head -200",
+            // 内核侧拒绝证据：SELinux avc denied、FUSE 内核错误、mount/namespace 失败
+            // 只在内核日志可见，logcat 的 kernel buffer 在多数真机不可用（恒为空），
+            // 故必须走 dmesg 通道。tail 限制输出量，保留最近匹配。
+            "commands/dmesg_evidence.txt" to
+                    "dmesg 2>/dev/null | grep -iE 'avc|fuse|mount|namespace' | tail -2000",
         )
         for ((entry, command) in commands) {
             addCommand(zip, entry, command)
-        }
-    }
-
-    private fun addDirectoryFiles(
-        zip: ZipOutputStream,
-        dir: File,
-        entryPrefix: String,
-        maxFiles: Int,
-    ) {
-        val all = dir.listFiles()
-            ?.filter { isRegularFileNoFollow(it) }
-            ?.sortedWith(compareByDescending<File> { it.lastModified() }.thenBy { it.name })
-            ?: emptyList()
-        val files = all.take(maxFiles)
-        addText(zip, "$entryPrefix/manifest.txt", buildString {
-            appendLine("path=${dir.path}")
-            appendLine("exists=${dir.exists()}")
-            // 可审计：记录目录总数，排障者可判断证据是否完整
-            appendLine("total=${all.size}")
-            appendLine("included=${files.size}")
-            for (file in files) {
-                appendLine("${file.name}\tsize=${file.length()}\tmodified=${file.lastModified()}")
-            }
-        })
-        for (file in files) {
-            addFileTail(zip, file, "$entryPrefix/${file.name}", MAX_TEXT_FILE_BYTES)
         }
     }
 
@@ -663,71 +644,6 @@ object DiagnosticArchive {
         addText(zip, entryName, section.toString(2))
     }
 
-    private fun addFileTail(zip: ZipOutputStream, file: File, entryName: String, maxBytes: Int) {
-        runCatching {
-            val content = buildString {
-                appendLine("path=${file.path}")
-                appendLine("size=${file.length()}")
-                appendLine("modified=${file.lastModified()}")
-                if (file.length() > maxBytes) {
-                    appendLine("truncated=head omitted, tailBytes=$maxBytes")
-                }
-                appendLine()
-                append(readFileTail(file, maxBytes))
-            }
-            addText(zip, entryName, content)
-        }.onFailure {
-            addText(zip, "$entryName.error.txt", it.stackTraceToString())
-        }
-    }
-
-    private fun readFileTail(file: File, maxBytes: Int): String {
-        val output = ByteArrayOutputStream()
-        if (file.length() <= maxBytes) {
-            FileInputStream(file).use { input ->
-                input.copyTo(output)
-            }
-        } else {
-            RandomAccessFile(file, "r").use { raf ->
-                raf.seek(file.length() - maxBytes)
-                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                var remaining = maxBytes
-                while (remaining > 0) {
-                    val read = raf.read(buffer, 0, minOf(buffer.size, remaining))
-                    if (read < 0) break
-                    output.write(buffer, 0, read)
-                    remaining -= read
-                }
-            }
-        }
-        return output.toString(StandardCharsets.UTF_8.name())
-    }
-
-    private fun addText(zip: ZipOutputStream, entryName: String, content: String) {
-        zip.putNextEntry(ZipEntry(safeEntryName(entryName)))
-        zip.write(redact(content).toByteArray(Charsets.UTF_8))
-        zip.closeEntry()
-    }
-
-    private fun redact(content: String): String {
-        var redacted = content
-        val fingerprint = Build.FINGERPRINT
-        if (fingerprint.isNotBlank()) {
-            redacted = redacted.replace(fingerprint, "<build-fingerprint>")
-        }
-        redacted = redacted
-            .replace(Regex("/data/app/[^\\s\\n\\r]+"), "/data/app/<redacted>")
-            .replace(Regex("/mnt/expand/[0-9A-Fa-f-]+"), "/mnt/expand/<volume>")
-            .replace(Regex("(?i)\\b[0-9a-f]{24,}\\b"), "<hex-id>")
-        return redacted
-    }
-
-    private fun safeEntryName(name: String): String =
-        name.replace('\\', '/').trimStart('/').replace("../", "_")
-
-    private fun isRegularFileNoFollow(file: File): Boolean =
-        Files.isRegularFile(file.toPath(), LinkOption.NOFOLLOW_LINKS)
-
     private fun cleanupOldArchives(dir: File) {
         runCatching {
             dir.listFiles()
@@ -742,4 +658,35 @@ object DiagnosticArchive {
 
     // 命令执行实现见 DiagnosticCommandRunner（G2 粒度抽离）；
     // 历史 CommandResult 已迁移为 DiagnosticCommandRunner.CommandResult。
+    // zip 写入与脱敏基础能力见文件末尾的顶层函数（G2 粒度抽离）。
 }
+
+/**
+ * 写入一个文本条目到诊断包。
+ *
+ * 置于顶层 internal：既被本文件的编排逻辑使用，也被
+ * [DiagnosticFileSection] 的文件取用逻辑使用。
+ */
+internal fun addText(zip: ZipOutputStream, entryName: String, content: String) {
+    zip.putNextEntry(ZipEntry(safeEntryName(entryName)))
+    zip.write(redact(content).toByteArray(Charsets.UTF_8))
+    zip.closeEntry()
+}
+
+/** 脱敏：移除构建指纹、APK 路径与长十六进制标识。 */
+internal fun redact(content: String): String {
+    var redacted = content
+    val fingerprint = Build.FINGERPRINT
+    if (fingerprint.isNotBlank()) {
+        redacted = redacted.replace(fingerprint, "<build-fingerprint>")
+    }
+    redacted = redacted
+        .replace(Regex("/data/app/[^\\s\\n\\r]+"), "/data/app/<redacted>")
+        .replace(Regex("/mnt/expand/[0-9A-Fa-f-]+"), "/mnt/expand/<volume>")
+        .replace(Regex("(?i)\\b[0-9a-f]{24,}\\b"), "<hex-id>")
+    return redacted
+}
+
+/** zip 条目名净化：去掉路径穿越与前导斜杠。 */
+internal fun safeEntryName(name: String): String =
+    name.replace('\\', '/').trimStart('/').replace("../", "_")

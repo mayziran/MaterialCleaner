@@ -94,6 +94,7 @@ public class CleanerServer extends ContextWrapper {
         };
         SecurityHelper.INSTANCE.init(dpsContext);
         ServicePreferences.INSTANCE.init(dpsContext);
+        me.gm.cleaner.runtime.server.orchestrator.ServerErrorJournal.INSTANCE.init(dpsContext);
         mPackageReceiver = new PackageReceiver(this);
         mAutoLogging = new AutoLogging(packageInfo);
         mCleanerServerCallback = new CleanerServerCallback();
@@ -140,5 +141,12 @@ public class CleanerServer extends ContextWrapper {
         }
         MediaProviderHookGateway.onDestroy();
         ObserverManager.INSTANCE.stopAllObservers();
+        try {
+            // 与 stopAllObservers 同类职责：server 退出前无条件回收采集子进程，
+            // 防止其随 init 收养成持续写文件的孤儿进程。
+            mAutoLogging.shutdown();
+        } catch (final Throwable t) {
+            Log.w(BuildConfig.LIBRARY_PACKAGE_NAME, "shutdown auto logging failed", t);
+        }
     }
 }
